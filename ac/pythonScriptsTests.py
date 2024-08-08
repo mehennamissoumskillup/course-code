@@ -1,80 +1,87 @@
 import unittest
 from unittest.mock import patch, MagicMock
+import logging
 import os
+import socket
 import uuid
-import json
-from elasticsearch import Elasticsearch, helpers
-from datetime import datetime
-from pathlib import Path
 
-# Assuming the methods are in a file named `curator.py`
-from curator import (
-    verifyAndGetVar, get_data_from_file, convertCertificateDatesToUTC,
-    bulk_json_data, push_data_to_elasticsearch, append_timestamp_to_es_document,
-    logger, indexName, es
-)
+class TestLoggingBuilder(unittest.TestCase):
 
-
-class TestCuratorMethods(unittest.TestCase):
-
+    @patch('logstash.TCPLogstashHandler')
     @patch('os.getenv')
-    @patch('curator.logger')
-    def test_verifyAndGetVar(self, mock_logger, mock_getenv):
-        # Mocking os.getenv to return None
-        mock_getenv.return_value = None
-        with self.assertRaises(SystemExit):
-            verifyAndGetVar('MISSING_VAR')
-        mock_logger.error.assert_called_once()
+    def test_build_logstash_handler(self, mock_getenv, mock_logstash_handler):
+        mock_getenv.side_effect = lambda key: {'LOGSTASH_HOST': 'localhost', 'LOGSTASH_PORT': '5044'}.get(key)
+        
+        builder = LoggingBuilder()
+        handler = builder.build_logstash_handler()
 
-        # Mocking os.getenv to return a value
-        mock_getenv.return_value = 'value'
-        result = verifyAndGetVar('EXISTING_VAR')
-        self.assertEqual(result, 'value')
+        mock_getenv.assert_any_call('LOGSTASH_HOST')
+        mock_getenv.assert_any_call('LOGSTASH_PORT')
+        mock_logstash_handler.assert_called_with('localhost', 5044, version=1)
+        self.assertIsInstance(handler, MagicMock)
 
-    @patch('pathlib.Path.open')
-    def test_get_data_from_file(self, mock_open):
-        # Mocking the JSON file content
-        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps([{"key": "value"}])
-        result = get_data_from_file('mock_file.json')
-        self.assertEqual(result, [{"key": "value"}])
+    @patch('logstash.TCPLogstashHandler')
+    @patch('os.getenv')
+    def test_build_application_logger(self, mock_getenv, mock_logstash_handler):
+        mock_getenv.side_effect = lambda key: {'LOGSTASH_HOST': 'localhost', 'LOGSTASH_PORT': '5044'}.get(key)
+        
+        builder = LoggingBuilder()
+        logger = builder.build_application_logger('test_logger')
 
-    def test_convertCertificateDatesToUTC(self):
-        doc = {
-            'end_date': '2023-08-01 12:00:00',
-            'start_date': '2023-01-01 00:00:00'
+        self.assertEqual(logger.name, 'test_logger')
+        self.assertEqual(logger.level, logging.DEBUG)
+        self.assertTrue(any(isinstance(h, MagicMock) for h in logger.handlers))
+
+    @patch('socket.gethostname')
+    def test_format_additional_logs(self, mock_gethostname):
+        mock_gethostname.return_value = 'test_host'
+        builder = LoggingBuilder()
+
+        extras = {
+            'service.name': 'test_service',
+            'service.environment': 'test_env',
+            'service.org': 'test_org'
         }
-        result = convertCertificateDatesToUTC(doc)
-        self.assertIsInstance(result['certificate_end_date'], datetime)
-        self.assertIsInstance(result['certificate_start_date'], datetime)
-        self.assertEqual(result['certificate_end_date'], datetime(2023, 8, 1, 12, 0, 0))
-        self.assertEqual(result['certificate_start_date'], datetime(2023, 1, 1, 0, 0, 0))
+        formatted_logs = builder.format_additional_logs(extras)
 
-    @patch('curator.get_data_from_file')
-    def test_bulk_json_data(self, mock_get_data_from_file):
-        # Mocking the JSON data
-        mock_get_data_from_file.return_value = [{'end_date': '2023-08-01 12:00:00', 'start_date': '2023-01-01 00:00:00'}]
-        generator = bulk_json_data('mock_file.json', 'mock_index', 'mock_type')
-        doc = next(generator)
-        self.assertIn('_index', doc)
-        self.assertIn('_type', doc)
-        self.assertIn('_id', doc)
-        self.assertIn('_source', doc)
+        self.assertEqual(formatted_logs['traceId'], builder.uniqid)
+        self.assertEqual(formatted_logs['service.name'], 'test_service')
+        self.assertEqual(formatted_logs['service.environment'], 'test_env')
+        self.assertEqual(formatted_logs['service.org'], 'test_org')
+        self.assertEqual(formatted_logs['service.hostname'], 'test_host')
 
-    @patch('curator.helpers.bulk')
-    @patch('curator.bulk_json_data')
-    @patch('curator.logger')
-    def test_push_data_to_elasticsearch(self, mock_logger, mock_bulk_json_data, mock_bulk):
-        # Mocking bulk to return a response
-        mock_bulk.return_value = 'mock_response'
-        push_data_to_elasticsearch()
-        mock_logger.info.assert_called_once()
-        mock_bulk.assert_called_once()
+        formatted_logs_empty = builder.format_additional_logs()
+        self.assertEqual(formatted_logs_empty, {'traceId': builder.uniqid, 'service.hostname': 'test_host'})
 
-    def test_append_timestamp_to_es_document(self):
-        doc = {}
-        append_timestamp_to_es_document(doc)
-        self.assertIn('timestamp', doc)
-        self.assertIsInstance(doc['timestamp'], str)
+class TestCuratorLogging(unittest.TestCase):
+
+    @patch('LoggingBuilder')
+    @patch('logging.getLogger')
+    def setUp(self, mock_get_logger, mock_logging_builder):
+        self.mock_logger = MagicMock()
+        mock_get_logger.return_value = self.mock_logger
+        self.mock_logging_builder = mock_logging_builder.return_value
+
+        self.curator_logger = CuratorLogging('test_logger')
+
+    def test_info(self):
+        self.curator_logger.info('test_info_message')
+        self.mock_logger.info.assert_called_once()
+        args, kwargs = self.mock_logger.info.call_args
+        self.assertEqual(args[0], 'test_info_message')
+
+    def test_warn(self):
+        self.curator_logger.warn('test_warn_message')
+        self.mock_logger.warning.assert_called_once()
+        args, kwargs = self.mock_logger.warning.call_args
+        self.assertEqual(args[0], 'test_warn_message')
+
+    def test_error(self):
+        self.curator_logger.error('test_error_message')
+        self.mock_logger.error.assert_called_once()
+        args, kwargs = self.mock_logger.error.call_args
+        self.assertEqual(args[0], 'test_error_message')
+
 
 if __name__ == '__main__':
     unittest.main()
